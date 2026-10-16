@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Two-Step Login with TOTP</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 640px; margin: 30px auto; padding: 0 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 26px; }
+  h2 { font-size: 20px; margin-top: 34px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+  button { font-size: 15px; padding: 8px 14px; margin: 4px 4px 4px 0; cursor: pointer; }
+  input { font-size: 20px; padding: 8px; width: 100%; max-width: 280px; letter-spacing: 3px; }
+  .box { background: #f4f4f4; padding: 10px; margin: 10px 0; word-break: break-all; font-family: monospace; }
+  .msg { padding: 8px 10px; margin: 10px 0; }
+  .ok { background: #d9f2d9; }
+  .bad { background: #f8d7d7; }
+  .warn { background: #fff3c4; }
+  .used { text-decoration: line-through; color: #999; }
+  .hidden { display: none; }
+  .small { font-size: 14px; color: #555; }
+</style>
+</head>
+<body>
+
+<h1>Two-Step Login with TOTP</h1>
+<p>Normally you log in with a password. With two-step login you also type a 6-digit code from your phone. The code changes every 30 seconds, so a stolen password alone is not enough to get in.</p>
+
+<h2>How it works</h2>
+<ol>
+  <li>The website gives your phone a secret, once, using a QR code.</li>
+  <li>Your phone mixes the secret with the current time to make a 6-digit code.</li>
+  <li>You type the code in. The website does the same maths, and if the codes match, you are in.</li>
+</ol>
+
+<h2>Try it</h2>
+<p id="banner"></p>
+
+<h3>Step 1: Create a secret</h3>
+<p>Press the button, then scan the QR code with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy).</p>
+<button id="createBtn">Create secret</button>
+<div id="setup" class="hidden">
+  <div id="qr" style="width:200px;height:200px"></div>
+  <p class="small">Can't scan? Choose "Enter a setup key" in your app and type this:</p>
+  <div class="box" id="keyText"></div>
+  <p class="small">No phone? Use the test code in the grey box under Step 3.</p>
+</div>
+
+<h3>Step 2: Check it works</h3>
+<p>Type the 6-digit code from your app. Spaces are fine.</p>
+<input id="confirmInput" inputmode="numeric" autocomplete="off" placeholder="123 456">
+<br>
+<button id="confirmBtn">Check code</button>
+<div id="confirmMsg"></div>
+<div id="backupBox" class="hidden">
+  <p><b>Backup codes</b> (use one if you lose your phone; each works once):</p>
+  <div class="box" id="backupList"></div>
+</div>
+
+<h3>Step 3: Log in</h3>
+<p>Type the current code, or a backup code.</p>
+<div class="box" id="testCode">Test code: create a secret first.</div>
+<input id="loginInput" autocomplete="off" placeholder="123 456">
+<br>
+<button id="loginBtn">Log in</button>
+<button id="resetBtn">Start over</button>
+<div id="loginMsg"></div>
+<p class="small" id="attempts"></p>
+
+<p class="small">Demo only: here the secret is made and checked in your browser. A real website does this on its server and never shows the secret again. Nothing you do here is sent anywhere.</p>
+
+<h2>Code not working?</h2>
+<ul>
+  <li>Spaces are fine: "123 456" and "123456" both work.</li>
+  <li>Set your phone's date and time to automatic. A wrong clock is the most common cause, and this page will tell you if your clock looks wrong.</li>
+  <li>If you made more than one secret, delete the old entries in your app and use the newest.</li>
+  <li>If the buttons do nothing, open the page with Live Server in VS Code (or from https://), not from a plain network address.</li>
+</ul>
+<p>Your computer's clock: <b id="clock">--:--:--</b></p>
+
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@2.0.4/dist/qrcode.js"></script>
+
+<script>
+
+const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+
+function makeSecret() {
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  let bits = "";
+  for (const b of bytes) bits += b.toString(2).padStart(8, "0");
+  let s = "";
+  for (let i = 0; i + 5 <= bits.length; i += 5) s += CHARS[parseInt(bits.substr(i, 5), 2)];
+  return s;
+}
+
+
+function secretToBytes(s) {
+  s = s.replace(/[\s=]/g, "").toUpperCase();
+  let bits = "";
+  for (const c of s) bits += CHARS.indexOf(c).toString(2).padStart(5, "0");
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.substr(i, 8), 2));
+  return new Uint8Array(bytes);
+}
+
+
+async function getCode(secret, timeMs) {
+  if (timeMs === undefined) timeMs = Date.now();
+  const timeStep = Math.floor(timeMs / 1000 / 30);        
+  const counter = new ArrayBuffer(8);
+  new DataView(counter).setUint32(4, timeStep);
+  const key = await crypto.subtle.importKey("raw", secretToBytes(secret), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const hash = new Uint8Array(await crypto.subtle.sign("HMAC", key, counter));
+  const o = hash[19] & 0x0f;
+  const n = ((hash[o] & 0x7f) << 24) | (hash[o + 1] << 16) | (hash[o + 2] << 8) | hash[o + 3];
+  return (n % 1000000).toString().padStart(6, "0");
+}
+
+
+async function findStep(secret, typed, range) {
+  for (let k = 0; k <= range; k++) {
+    for (const step of (k === 0 ? [0] : [-k, k])) {
+      if (await getCode(secret, Date.now() + step * 30000) === typed) return step;
+    }
+  }
+  return null;
+}
+async function verifyCode(secret, typed) { return (await findStep(secret, typed, 1)) !== null; }
+
+
+function makeBackupCodes() {
+  const out = [];
+  while (out.length < 8) {
+    const n = new Uint32Array(2);
+    crypto.getRandomValues(n);
+    const t = String(n[0] % 10000).padStart(4, "0") + "-" + String(n[1] % 10000).padStart(4, "0");
+    if (!out.some(function (c) { return c.text === t; })) out.push({ text: t, used: false });
+  }
+  return out;
+}
+
+
+function cleanInput(raw) {
+  const d = raw.replace(/\D/g, "");
+  return d.length === 8 ? d.slice(0, 4) + "-" + d.slice(4) : d;
+}
+function pretty(c) { return c.slice(0, 3) + " " + c.slice(3); }
+
+
+const $ = function (id) { return document.getElementById(id); };
+const MAX_TRIES = 5;
+let secret = "", confirmed = false, backupCodes = [], failed = 0, lockedUntil = 0, lastUrl = "";
+
+function msg(id, type, text) { $(id).innerHTML = '<div class="msg ' + type + '">' + text + "</div>"; }
+
+
+function createSecret() {
+  secret = makeSecret();
+  confirmed = false; backupCodes = []; failed = 0; lockedUntil = 0;
+  lastUrl = "otpauth://totp/MyWebApp:demo-user?secret=" + secret + "&issuer=MyWebApp&algorithm=SHA1&digits=6&period=30";
+  try {
+    const qr = qrcode(0, "M");
+    qr.addData(lastUrl);
+    qr.make();
+    $("qr").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  } catch (e) {
+    $("qr").textContent = "The QR code could not be drawn. Use the setup key.";
+  }
+  $("keyText").textContent = secret.match(/.{1,4}/g).join(" ");
+  $("setup").classList.remove("hidden");
+  $("backupBox").classList.add("hidden");
+  $("confirmMsg").innerHTML = ""; $("loginMsg").innerHTML = "";
+  showTries(); tick();
+}
+
+
+async function whyWrong(typed) {
+  if (!/^\d{6}$/.test(typed)) return "A code has 6 digits. Check you typed all six.";
+  const k = await findStep(secret, typed, 20);
+  if (k !== null && Math.abs(k) > 1) {
+    const s = Math.abs(k) * 30;
+    return "That code is real, but it is from about " + s + " seconds " + (k < 0 ? "ago" : "in the future") +
+           ". Your phone's clock looks about " + s + " seconds " + (k < 0 ? "slow" : "fast") +
+           ". Turn on automatic date and time on your phone and try again.";
+  }
+  return "That code does not match. Check you are reading the MyWebApp entry in your app (the newest one if you made several).";
+}
+
+
+async function confirmCode() {
+  if (!secret) { msg("confirmMsg", "warn", "Do Step 1 first."); return; }
+  const typed = cleanInput($("confirmInput").value);
+  if (await verifyCode(secret, typed)) {
+    confirmed = true;
+    backupCodes = makeBackupCodes();
+    drawBackup();
+    $("backupBox").classList.remove("hidden");
+    msg("confirmMsg", "ok", "Correct. Two-step login is now on. Save your backup codes below.");
+  } else {
+    msg("confirmMsg", "bad", await whyWrong(typed));
+  }
+}
+
+function drawBackup() {
+  $("backupList").innerHTML = backupCodes.map(function (c) {
+    return '<span class="' + (c.used ? "used" : "") + '">' + c.text + "</span>";
+  }).join("<br>");
+}
+
+
+function showTries() {
+  $("attempts").textContent = "Wrong tries: " + failed + " of " + MAX_TRIES + " (then locked for 30 seconds).";
+}
+
+async function login() {
+  if (!secret || !confirmed) { msg("loginMsg", "warn", "Finish Steps 1 and 2 first."); return; }
+  if (Date.now() < lockedUntil) {
+    msg("loginMsg", "bad", "Locked. Try again in " + Math.ceil((lockedUntil - Date.now()) / 1000) + " seconds.");
+    return;
+  }
+  const typed = cleanInput($("loginInput").value);
+  const backup = backupCodes.find(function (c) { return c.text === typed && !c.used; });
+  let how = "";
+  if (backup) { backup.used = true; drawBackup(); how = "a backup code (now used up)"; }
+  else if (/^\d{6}$/.test(typed) && await verifyCode(secret, typed)) { how = "your authenticator code"; }
+
+  if (how) {
+    failed = 0; showTries();
+    msg("loginMsg", "ok", "Logged in with " + how + ".");
+    return;
+  }
+  failed++;
+  if (failed >= MAX_TRIES) {
+    lockedUntil = Date.now() + 30000; failed = 0;
+    msg("loginMsg", "bad", "Too many wrong tries. Locked for 30 seconds.");
+  } else {
+    msg("loginMsg", "bad", await whyWrong(typed));
+  }
+  showTries();
+}
+
+function startOver() {
+  secret = ""; confirmed = false; backupCodes = []; failed = 0; lockedUntil = 0; lastUrl = "";
+  $("setup").classList.add("hidden"); $("backupBox").classList.add("hidden");
+  $("qr").innerHTML = ""; $("keyText").textContent = "";
+  $("confirmInput").value = ""; $("loginInput").value = "";
+  $("confirmMsg").innerHTML = ""; $("loginMsg").innerHTML = "";
+  $("testCode").textContent = "Test code: create a secret first.";
+  showTries();
+}
+
+
+async function tick() {
+  $("clock").textContent = new Date().toLocaleTimeString();
+  if (!secret) return;
+  try {
+    const left = 30 - (Math.floor(Date.now() / 1000) % 30);
+    $("testCode").textContent = "Test code (same as your phone shows): " + pretty(await getCode(secret)) + "  (changes in " + left + "s)";
+  } catch (e) { /* the banner explains if crypto is unavailable */ }
+}
+
+function init() {
+  if (!(window.crypto && window.crypto.subtle)) {
+    $("banner").innerHTML = '<span class="msg bad">Your browser has switched off the tools this demo needs. Open the page with Live Server in VS Code, or from https://, not from a plain network address.</span>';
+    $("createBtn").disabled = true;
+  }
+  $("createBtn").onclick = createSecret;
+  $("confirmBtn").onclick = confirmCode;
+  $("loginBtn").onclick = login;
+  $("resetBtn").onclick = startOver;
+  $("confirmInput").addEventListener("keydown", function (e) { if (e.key === "Enter") confirmCode(); });
+  $("loginInput").addEventListener("keydown", function (e) { if (e.key === "Enter") login(); });
+  showTries();
+  setInterval(tick, 1000);
+  tick();
+}
+init();
+</script>
+</body>
+</html>
